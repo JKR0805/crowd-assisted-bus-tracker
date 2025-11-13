@@ -45,7 +45,7 @@ html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, san
 #map {
     position: absolute;
     top: 72px;
-    bottom: 84px;
+    bottom: 76px;
     left: 0;
     right: 0;
 }

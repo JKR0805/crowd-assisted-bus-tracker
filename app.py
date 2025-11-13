@@ -234,17 +234,19 @@ def student_page():
 last_update_time = {}
 MIN_UPDATE_INTERVAL = 1.0  # seconds
 
+# Track last student location update time
+last_student_update = {}
+
+# Student location sharing toggle (per bus)
+student_location_enabled = {}  # {bus_id: True/False}
+
 # --- API ---
 @app.post("/location/share")
 @login_required
 def share_location():
-    """Only for drivers - students get 'coming soon' message on frontend"""
+    """Allow both drivers and students to share location"""
     try:
         user_type = session.get('role')
-        
-        # Only allow drivers to share location
-        if user_type != 'driver':
-            return jsonify({"error": "Location sharing not available for students"}), 403
         
         # Rate limiting check
         user_id = session.get('username')
@@ -272,55 +274,86 @@ def share_location():
         except (ValueError, TypeError):
             return jsonify({"error": "Invalid location data"}), 400
         
-        # Update last driver update time
-        last_driver_update[bus_id] = now
+        # Check if student location sharing is enabled for this bus
+        if user_type == 'student':
+            if not student_location_enabled.get(bus_id, False):
+                return jsonify({"error": "Student location sharing is disabled"}), 403
         
-        # Update driver's location
+        # Store location in database for all users
         dbm.update_user_location(bus_id, user_id, user_type, lat, lon, accuracy)
         last_update_time[user_id] = now
         
-        # Check proximity to stops FIRST (within 50 meters)
-        proximity_result = dbm.check_stop_proximity(bus_id, lat, lon, radius_meters=50)
+        # Update last update time based on user type
+        if user_type == 'driver':
+            last_driver_update[bus_id] = now
+        else:  # student
+            last_student_update[bus_id] = now
         
-        current_state = dbm.get_bus_state(bus_id)
+        # Priority logic: Determine if this user should update bus position
+        # Priority: Driver GPS > Student GPS > Manual controls
+        should_update_bus = False
+        location_source = None
         
-        if proximity_result:
-            # Driver is near a stop (within 50m)
-            stop_id = proximity_result['id']
-            stop_index = proximity_result['seq']
+        if user_type == 'driver':
+            # Driver always updates bus position
+            should_update_bus = True
+            location_source = 'driver'
+        elif user_type == 'student':
+            # Student only updates if driver GPS is not active (>30 seconds old)
+            if bus_id not in last_driver_update:
+                should_update_bus = True
+                location_source = 'student'
+            else:
+                seconds_since_driver = (now - last_driver_update[bus_id]).total_seconds()
+                if seconds_since_driver > 30:
+                    should_update_bus = True
+                    location_source = 'student'
+        
+        # Update bus position if this is the authoritative source
+        if should_update_bus:
             
-            # Snap to stop coordinates for clean positioning
-            state = dbm.set_bus_to_stop(bus_id, stop_index)
-            bus_status[bus_id] = "arrived"
+            # Check proximity to stops FIRST (within 50 meters)
+            proximity_result = dbm.check_stop_proximity(bus_id, lat, lon, radius_meters=50)
             
-            app.logger.info(f"Bus {bus_id} arrived at stop {proximity_result['name']} (within 50m)")
-        else:
-            # Not near any stop - update to exact GPS coordinates
-            state = dbm.update_bus_location(bus_id, lat, lon)
+            current_state = dbm.get_bus_state(bus_id)
             
-            # Determine if departing from current stop
-            if current_state and current_state['stop_index'] is not None:
-                current_stop = dbm.current_stop_for_index(current_state['stop_index'])
-                if current_stop:
-                    # Check distance from current stop
-                    distance_from_current = dbm.calculate_distance(
-                        lat, lon, current_stop['lat'], current_stop['lon']
-                    )
-                    
-                    if distance_from_current > 50:
-                        # Moving away from current stop
-                        bus_status[bus_id] = "departing"
-                        # Get next stop for status message
-                        next_stop = dbm.current_stop_for_index(current_state['stop_index'] + 1)
-                        if next_stop:
-                            app.logger.info(f"Bus {bus_id} departing to {next_stop['name']}")
+            if proximity_result:
+                # Driver is near a stop (within 50m)
+                stop_id = proximity_result['id']
+                stop_index = proximity_result['seq']
+                
+                # Snap to stop coordinates for clean positioning
+                state = dbm.set_bus_to_stop(bus_id, stop_index)
+                bus_status[bus_id] = "arrived"
+                
+                app.logger.info(f"Bus {bus_id} arrived at stop {proximity_result['name']} (within 50m)")
+            else:
+                # Not near any stop - update to exact GPS coordinates
+                state = dbm.update_bus_location(bus_id, lat, lon)
+                
+                # Determine if departing from current stop
+                if current_state and current_state['stop_index'] is not None:
+                    current_stop = dbm.current_stop_for_index(current_state['stop_index'])
+                    if current_stop:
+                        # Check distance from current stop
+                        distance_from_current = dbm.calculate_distance(
+                            lat, lon, current_stop['lat'], current_stop['lon']
+                        )
+                        
+                        if distance_from_current > 50:
+                            # Moving away from current stop
+                            bus_status[bus_id] = "departing"
+                            # Get next stop for status message
+                            next_stop = dbm.current_stop_for_index(current_state['stop_index'] + 1)
+                            if next_stop:
+                                app.logger.info(f"Bus {bus_id} departing to {next_stop['name']}")
+                        else:
+                            # Still near current stop but not snapped
+                            bus_status[bus_id] = "arrived"
                     else:
-                        # Still near current stop but not snapped
-                        bus_status[bus_id] = "arrived"
+                        bus_status[bus_id] = "departing"
                 else:
                     bus_status[bus_id] = "departing"
-            else:
-                bus_status[bus_id] = "departing"
         
         # Get updated state and stop info
         state = dbm.get_bus_state(bus_id)
@@ -331,7 +364,10 @@ def share_location():
                 "stop_name": stop["name"] if stop else None,
                 "stop_id": stop["id"] if stop else None,
                 "status": bus_status.get(bus_id),
-                "accuracy": accuracy
+                "accuracy": accuracy,
+                "user_type": user_type,  # Include user type in response
+                "location_source": location_source if should_update_bus else None,
+                "updated_bus": should_update_bus  # Did this update move the bus?
             })
         
         return jsonify(state)
@@ -431,16 +467,32 @@ def driver_departed():
     if bus_id != session.get('bus_id'):
         return jsonify({"error": "unauthorized"}), 403
     
-    # Check if we have recent driver location
+    # Check if we have recent driver or student location
     now = datetime.now()
+    gps_active = False
+    gps_source = None
+    
+    # Priority 1: Check driver GPS
     if bus_id in last_driver_update:
         seconds_since_update = (now - last_driver_update[bus_id]).total_seconds()
         if seconds_since_update < 30:
-            return jsonify({
-                "error": "Using live GPS - manual control disabled",
-                "message": "Bus position is being tracked via GPS",
-                "gps_active": True
-            }), 400
+            gps_active = True
+            gps_source = 'driver'
+    
+    # Priority 2: Check student GPS if driver not active
+    if not gps_active and bus_id in last_student_update:
+        seconds_since_update = (now - last_student_update[bus_id]).total_seconds()
+        if seconds_since_update < 30:
+            gps_active = True
+            gps_source = 'student'
+    
+    if gps_active:
+        return jsonify({
+            "error": "Using live GPS - manual control disabled",
+            "message": f"Bus position is being tracked via {gps_source} GPS",
+            "gps_active": True,
+            "gps_source": gps_source
+        }), 400
     
     # Fallback: set status to departing without moving
     bus_status[bus_id] = "departing"
@@ -467,16 +519,32 @@ def driver_arrived():
     if bus_id != session.get('bus_id'):
         return jsonify({"error": "unauthorized"}), 403
     
-    # Check if we have recent driver location
+    # Check if we have recent driver or student location
     now = datetime.now()
+    gps_active = False
+    gps_source = None
+    
+    # Priority 1: Check driver GPS
     if bus_id in last_driver_update:
         seconds_since_update = (now - last_driver_update[bus_id]).total_seconds()
         if seconds_since_update < 30:
-            return jsonify({
-                "error": "Using live GPS - manual control disabled",
-                "message": "Bus position is being tracked via GPS",
-                "gps_active": True
-            }), 400
+            gps_active = True
+            gps_source = 'driver'
+    
+    # Priority 2: Check student GPS if driver not active
+    if not gps_active and bus_id in last_student_update:
+        seconds_since_update = (now - last_student_update[bus_id]).total_seconds()
+        if seconds_since_update < 30:
+            gps_active = True
+            gps_source = 'student'
+    
+    if gps_active:
+        return jsonify({
+            "error": "Using live GPS - manual control disabled",
+            "message": f"Bus position is being tracked via {gps_source} GPS",
+            "gps_active": True,
+            "gps_source": gps_source
+        }), 400
     
     action = data.get("action")
     if action != "arrived":
@@ -539,6 +607,63 @@ def stop_location_sharing():
         "gps_active": False
     })
 
+@app.post("/driver/toggle-student-location")
+@login_required
+@role_required('driver')
+def toggle_student_location():
+    """Toggle student location sharing on/off"""
+    data = request.get_json(force=True)
+    bus_id = data.get("bus_id", BUS_ID)
+    enabled = data.get("enabled", False)
+    
+    # Verify the driver is assigned to this bus
+    if bus_id != session.get('bus_id'):
+        return jsonify({"error": "unauthorized"}), 403
+    
+    # Update the toggle state
+    student_location_enabled[bus_id] = enabled
+    
+    # If disabling, clear all student location updates
+    if not enabled:
+        last_student_update.pop(bus_id, None)
+        app.logger.info(f"Student location sharing disabled for bus {bus_id}")
+    else:
+        app.logger.info(f"Student location sharing enabled for bus {bus_id}")
+    
+    return jsonify({
+        "bus_id": bus_id,
+        "student_location_enabled": enabled,
+        "message": f"Student location sharing {'enabled' if enabled else 'disabled'}"
+    })
+
+@app.get("/driver/student-location-status")
+@login_required
+@role_required('driver')
+def get_student_location_status():
+    """Get current student location sharing status"""
+    bus_id = request.args.get("bus_id", BUS_ID)
+    
+    # Verify the driver is assigned to this bus
+    if bus_id != session.get('bus_id'):
+        return jsonify({"error": "unauthorized"}), 403
+    
+    return jsonify({
+        "bus_id": bus_id,
+        "student_location_enabled": student_location_enabled.get(bus_id, False)
+    })
+
+@app.get("/student/location-status")
+@login_required
+@role_required('student')
+def get_student_sharing_status():
+    """Check if student location sharing is enabled"""
+    bus_id = request.args.get("bus_id", BUS_ID)
+    
+    return jsonify({
+        "bus_id": bus_id,
+        "enabled": student_location_enabled.get(bus_id, False)
+    })
+
 @app.post("/student/arrived")
 @login_required
 @role_required('student')
@@ -548,13 +673,24 @@ def student_arrived():
     bus_id = data.get("bus_id", BUS_ID)
     student_id = session.get('username', 'S1')  # Use logged in username as student ID
 
-    # Check if driver's GPS is active
+    # Check if driver's or student's GPS is active
     now = datetime.now()
     gps_active = False
+    gps_source = None
+    
+    # Priority 1: Check driver GPS
     if bus_id in last_driver_update:
         seconds_since_update = (now - last_driver_update[bus_id]).total_seconds()
         if seconds_since_update < 30:
             gps_active = True
+            gps_source = 'driver'
+    
+    # Priority 2: Check student GPS if driver not active
+    if not gps_active and bus_id in last_student_update:
+        seconds_since_update = (now - last_student_update[bus_id]).total_seconds()
+        if seconds_since_update < 30:
+            gps_active = True
+            gps_source = 'student'
 
     state = dbm.get_bus_state(bus_id)
     if not state:

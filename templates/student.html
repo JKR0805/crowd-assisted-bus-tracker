@@ -18,11 +18,16 @@
       </div>
       <span id="lastUpdate" class="timestamp-badge">--:--</span>
     </div>
+    <a href="/logout" class="logout-btn" title="Logout">
+      <svg viewBox="0 0 24 24" style="width: 20px; height: 20px;">
+        <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/>
+      </svg>
+    </a>
   </header>
   <div id="map"></div>
   <div class="actions">
     <button id="arrivedBtn" class="btn">ARRIVED</button>
-    <button id="shareLocationBtn" class="location-btn" title="Coming Soon">
+    <button id="shareLocationBtn" class="location-btn" title="Share Location">
       <svg viewBox="0 0 24 24" style="transform: translateY(1px)">
         <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zM12 6.5l2.5 2.5h-2v3h-1v-3h-2L12 6.5z"/>
       </svg>
@@ -41,7 +46,7 @@
     /* Toast notification */
     .toast {
       position: fixed;
-      bottom: 120px;
+      bottom: 90px;
       left: 50%;
       transform: translateX(-50%);
       background: #333;
@@ -97,6 +102,39 @@
       margin-left: 8px;
       display: inline-block;
     }
+
+    /* Logout button - floating in top-right */
+    .logout-btn {
+      position: fixed;
+      top: 80px;
+      right: 16px;
+      width: 44px;
+      height: 44px;
+      background: #fff;
+      border: 2px solid #ddd;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      cursor: pointer;
+      z-index: 1000;
+      text-decoration: none;
+      transition: all 0.3s ease;
+    }
+
+    .logout-btn:hover {
+      background: #f0f0f0;
+    }
+
+    .logout-btn:active {
+      transform: scale(0.95);
+    }
+
+    .logout-btn svg {
+      fill: #333;
+    }
+
     /* Location sharing button styles */
     .location-btn {
       width: 56px;
@@ -121,37 +159,56 @@
       background: #34c759;
     }
 
+    .location-btn:disabled {
+      background: #999;
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+
     .location-btn svg {
       width: 28px;
       height: 28px;
       fill: #000;
     }
 
-    /* Updated actions container - fixed spacing */
+    /* Updated actions container - reduced spacing */
     .actions {
       position: fixed;
       left: 0;
       right: 0;
       bottom: 0;
       background: #fff;
-      padding: 16px;
+      padding: 12px 16px;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 16px;
+      gap: 12px;
       box-shadow: 0 -2px 4px rgba(0,0,0,0.1);
-      min-height: 88px;
+      min-height: 76px;
       box-sizing: border-box;
     }
 
     .actions .btn {
       flex: 1;
       max-width: 280px;
-      height: 56px;
+      height: 52px;
       display: flex;
       align-items: center;
       justify-content: center;
       margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      border: none;
+      border-radius: 24px;
+      background: #3b82f6;
+      color: #fff;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);
+    }
+
+    .actions .btn:active {
+      transform: scale(0.98);
     }
   </style>
 
@@ -169,16 +226,122 @@
         toast.classList.remove('show');
       }, 2000);
     }
+
+    let locationWatchId = null;
+    let studentLocationAllowed = false;
+
+    function handleLocationError(error) {
+      console.error('Error getting location:', error);
+      const btn = document.getElementById('shareLocationBtn');
+      btn.classList.remove('active');
+      showToast('Could not get location. Please check GPS settings.');
+    }
+
+    function shareLocation(position) {
+      const { latitude, longitude, accuracy } = position.coords;
+      
+      fetch('/location/share', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          bus_id: BUS_ID,
+          lat: latitude,
+          lon: longitude,
+          accuracy: accuracy
+        })
+      }).then(async r => {
+        const state = await r.json();
+        if (r.status === 403) {
+          // Student location sharing was disabled
+          console.log('Student location sharing disabled by driver');
+          stopLocationSharing();
+          showToast('Location sharing disabled by driver');
+          checkStudentLocationStatus(); // Refresh status
+        } else if (state.error) {
+          console.error('Location share error:', state.error);
+        }
+      }).catch(error => {
+        console.error('Error sharing location:', error);
+      });
+    }
+
+    function stopLocationSharing() {
+      if (locationWatchId) {
+        navigator.geolocation.clearWatch(locationWatchId);
+        locationWatchId = null;
+        document.getElementById('shareLocationBtn').classList.remove('active');
+      }
+    }
+
+    // Check if student location sharing is enabled
+    function checkStudentLocationStatus() {
+      fetch(`/student/location-status?bus_id=${encodeURIComponent(BUS_ID)}`)
+        .then(r => r.json())
+        .then(data => {
+          studentLocationAllowed = data.enabled || false;
+          updateLocationButtonState();
+        })
+        .catch(err => console.error('Error checking location status:', err));
+    }
+
+    function updateLocationButtonState() {
+      const btn = document.getElementById('shareLocationBtn');
+      if (!studentLocationAllowed) {
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        btn.style.cursor = 'not-allowed';
+        btn.title = 'Location sharing disabled by driver';
+        stopLocationSharing();
+      } else {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+        btn.style.cursor = 'pointer';
+        btn.title = 'Share Location';
+      }
+    }
+
+    // Location sharing button
+    document.getElementById('shareLocationBtn').addEventListener('click', function() {
+      if (!studentLocationAllowed) {
+        showToast('Location sharing is disabled');
+        return;
+      }
+      
+      if (!locationWatchId) {
+        // Start sharing location
+        if ("geolocation" in navigator) {
+          this.classList.add('active');
+          showToast('GPS Tracking Started');
+          
+          // Get initial position
+          navigator.geolocation.getCurrentPosition(shareLocation, handleLocationError, {
+            enableHighAccuracy: true,
+            timeout: 5000,
+            maximumAge: 0
+          });
+          
+          // Set up continuous watching
+          locationWatchId = navigator.geolocation.watchPosition(shareLocation, handleLocationError, {
+            enableHighAccuracy: true,
+            timeout: 5000,
+            maximumAge: 1000
+          });
+        } else {
+          showToast('Geolocation not supported');
+        }
+      } else {
+        // Stop sharing location
+        navigator.geolocation.clearWatch(locationWatchId);
+        locationWatchId = null;
+        this.classList.remove('active');
+        showToast('GPS Tracking Stopped');
+      }
+    });
   </script>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     let map = L.map('map');
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
-
-    // Share location button - shows "Coming Soon" message
-    document.getElementById('shareLocationBtn').addEventListener('click', function() {
-      showToast('Coming Soon');
-    });
 
     // Center on bus button
     document.getElementById('centerBusBtn').addEventListener('click', function() {
@@ -190,7 +353,6 @@
         });
       }
     });
-
     // Create custom bus icon
     const busIcon = L.divIcon({ 
       html: `<div style="font-size: 36px; text-align: center;">🚌</div>`,
@@ -325,6 +487,10 @@
     // Check GPS status periodically (every 5 seconds)
     checkGPSStatus();
     setInterval(checkGPSStatus, 5000);
+    
+    // Check student location sharing status periodically (every 3 seconds)
+    checkStudentLocationStatus();
+    setInterval(checkStudentLocationStatus, 3000);
   </script>
 </body>
 </html> 

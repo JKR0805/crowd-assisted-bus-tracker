@@ -114,21 +114,6 @@ def init_db() -> None:
         )
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_locations(
-            id INTEGER PRIMARY KEY,
-            bus_id TEXT,
-            user_id TEXT,
-            user_type TEXT,
-            lat REAL,
-            lon REAL,
-            accuracy REAL,
-            timestamp TEXT,
-            UNIQUE(bus_id, user_id) ON CONFLICT REPLACE
-        )
-        """
-    )
     conn.commit()
 
     # Reseed stops every run to enforce the configured list
